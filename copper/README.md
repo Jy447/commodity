@@ -3,11 +3,61 @@
 ================================================================================
 
   Files:
-    1. features.py   - Volatility-based signals for CL=F (26 signals + composites)
-    2. copper.ipynb   - Exploratory analysis notebook
-    3. test.py        - 6-signal Donchian ensemble with KF + HMM (Sharpe 2.38 OOS)
-    4. model.py       - LSTM model with AlphaLib feature generation + strategy
-    requirements.txt  - Python dependencies
+    1. features.py    - Volatility-based signals for CL=F (26 signals + composites)
+    2. copper.ipynb    - Exploratory analysis notebook
+    3. test.py         - 6-signal Donchian ensemble with KF + HMM (Sharpe 2.38 OOS)
+    4. model.py        - LSTM model with AlphaLib features + strategy (monolithic)
+    requirements.txt   - Python dependencies
+
+  Modular Pipeline (split from 4. model.py):
+    config.py          - Constants, hyperparameters, paths, random seeds
+    utils.py           - Rolling/stat helpers (sma, ts_sum, rolling_vol, ATR, etc.)
+    alpha_lib.py       - AlphaLib class (~100 cross-sectional alpha features)
+    signals.py         - Kalman filter, Donchian stateful, HMM regime detection
+    data_loader.py     - Step 1: Load parquet/CSVs, prepare features -> PipelineData
+    analysis.py        - Steps 2-4: Distribution analysis, correlations, feature selection
+    alpha_eval.py      - Step 4.5: Alpha signal IC/IR evaluation, position building
+    models.py          - Steps 5-7: Linear Regression baseline, LSTM training, evaluation
+    strategies.py      - Step 8: Build all trading strategies (Donchian + LSTM + Alpha)
+    results.py         - Step 9: Performance tables + 7x3 master figure
+    run_pipeline.py    - Main orchestrator (~50 lines, calls all modules in sequence)
+
+================================================================================
+  USAGE
+================================================================================
+
+  Run the full pipeline:
+
+    python -u copper/run_pipeline.py
+
+  This executes Steps 1-9 in sequence and produces:
+    - claude/model_results.png       (7x3 master figure)
+    - claude/dist_analysis.png       (return distribution plots)
+    - claude/correlation_heatmap.png  (feature-return correlation matrix)
+
+  On first run with USE_PARQUET=False, CSVs are loaded and AlphaLib features
+  are computed (takes several minutes). Results are cached to
+  claude/copper_alpha_features.parquet. Subsequent runs with USE_PARQUET=True
+  (default) load the parquet in seconds.
+
+  To modify individual components:
+    - Add new alpha features     -> alpha_lib.py (AlphaLib.calcu_alpha)
+    - Add new signals            -> signals.py
+    - Change model architecture  -> models.py (CopperLSTM class)
+    - Add/remove strategies      -> strategies.py (build_strategies)
+    - Change plots/tables        -> results.py (generate_results)
+    - Tune hyperparameters       -> config.py
+
+  Data flow (no globals, explicit dataclass inputs/outputs):
+
+    load_data()                  -> PipelineData
+    run_distribution_analysis()  -> (plots only)
+    run_correlation_analysis()   -> AnalysisResults
+    run_alpha_evaluation()       -> AlphaEvalResults
+    train_linear_regression()    -> LRResults
+    train_lstm()                 -> LSTMResults
+    build_strategies()           -> StrategyResults
+    generate_results()           -> (tables + plots)
 
 ================================================================================
   THE CORE THESIS

@@ -6,6 +6,7 @@ Step 1: Load features (parquet fast-path OR CSV+AlphaLib full build)
 Step 2: Return distribution analysis (histogram, QQ, JB, ADF, ACF)
 Step 3: Feature-return correlations (|corr| > 0.10 filter)
 Step 4: Feature selection summary by category
+Step 4.5: Alpha signal evaluation (IC, IR, standalone alpha strategies)
 Step 5: Linear Regression baseline (per horizon: log_ret20, log_ret30, log_ret60)
 Step 6: LSTM model training (per horizon, 2-layer 64 hidden, z-score target)
 Step 7: Model evaluation -- LR vs LSTM comparison per horizon
@@ -778,6 +779,223 @@ for target_name in HORIZONS.keys():
         print(f"    {cat:12s}: {count:3d}  ({', '.join(feats_in_cat[:5])}{'...' if len(feats_in_cat) > 5 else ''})")
 
 # ======================================================================
+# 4.5 ALPHA SIGNAL EVALUATION
+# ======================================================================
+print("\n" + "=" * 70)
+print("  STEP 4.5: Alpha Signal Evaluation")
+print("=" * 70)
+
+def compute_rolling_ic(alpha_arr, return_arr, window=252):
+    """Rolling Spearman IC via rank-then-Pearson on numpy arrays."""
+    n = len(alpha_arr)
+    ics = np.full(n, np.nan)
+    for i in range(window, n):
+        a = alpha_arr[i-window:i]
+        r = return_arr[i-window:i]
+        mask = np.isfinite(a) & np.isfinite(r)
+        if mask.sum() > 50:
+            ra = stats.rankdata(a[mask]).astype(float)
+            rr = stats.rankdata(r[mask]).astype(float)
+            ra -= ra.mean(); rr -= rr.mean()
+            d = np.sqrt(np.dot(ra, ra) * np.dot(rr, rr))
+            ics[i] = np.dot(ra, rr) / d if d > 0 else 0
+    return ics
+
+# --- 4.5a: Per-alpha metrics on TRAIN set ---
+print("\n--- 4.5a: Per-alpha signal metrics (Train set) ---")
+
+alpha_signal_metrics = {}
+
+for target_name, h in HORIZONS.items():
+    print(f"\n  Computing metrics for {target_name} (horizon={h})...")
+    target_s = train_for_corr[target_name]
+
+    horizon_metrics = {}
+    for feat in feature_cols:
+        feat_s = train_for_corr[feat]
+        valid = feat_s.notna() & target_s.notna()
+        if valid.sum() < 252:
+            continue
+        fv = feat_s[valid].values
+        tv = target_s[valid].values
+
+        pearson_val = corr_results[target_name].get(feat, np.nan)
+        ic_val, _ = stats.spearmanr(fv, tv)
+        dir_acc = np.mean(np.sign(fv) == np.sign(tv)) * 100
+        turnover_val = np.mean(np.abs(np.diff(fv))) if len(fv) > 1 else np.nan
+
+        horizon_metrics[feat] = dict(
+            pearson=pearson_val, ic=ic_val,
+            dir_acc=dir_acc, turnover=turnover_val)
+
+    # Rolling IC for features with |IC| > 0.02 (pre-filter for speed)
+    ic_cands = [f for f, m in horizon_metrics.items() if abs(m['ic']) > 0.02]
+    print(f"    {len(ic_cands)}/{len(horizon_metrics)} pass |IC|>0.02 for rolling IC")
+
+    target_arr = train_for_corr[target_name].values
+    for feat in ic_cands:
+        feat_arr = train_for_corr[feat].fillna(0).values
+        rics = compute_rolling_ic(feat_arr, target_arr, 252)
+        v_ics = rics[np.isfinite(rics)]
+        if len(v_ics) > 10:
+            m_ic = np.mean(v_ics)
+            s_ic = np.std(v_ics)
+            ir = m_ic / s_ic if s_ic > 0 else 0
+        else:
+            m_ic = horizon_metrics[feat]['ic']
+            s_ic = np.nan
+            ir = 0
+        horizon_metrics[feat].update(
+            mean_rolling_ic=m_ic, std_rolling_ic=s_ic, ir=ir)
+
+    # Defaults for features that didn't pass pre-filter
+    for feat in horizon_metrics:
+        if 'ir' not in horizon_metrics[feat]:
+            horizon_metrics[feat].update(
+                mean_rolling_ic=horizon_metrics[feat]['ic'],
+                std_rolling_ic=np.nan, ir=0)
+
+    alpha_signal_metrics[target_name] = horizon_metrics
+
+    # Print top 30 by |IR|
+    ranked = sorted(horizon_metrics.items(),
+                    key=lambda x: abs(x[1]['ir']), reverse=True)
+    print(f"\n  Top 30 alphas by |IR| for {target_name}:")
+    print(f"    {'Feature':<35} {'Pearson':>8} {'IC':>8} {'MeanIC':>8} "
+          f"{'IR':>8} {'DirAcc':>8}")
+    print(f"    {'-'*78}")
+    for feat, m in ranked[:30]:
+        print(f"    {feat:<35} {m['pearson']:>8.4f} {m['ic']:>8.4f} "
+              f"{m.get('mean_rolling_ic',0):>8.4f} {m['ir']:>8.4f} "
+              f"{m['dir_acc']:>7.1f}%")
+
+# --- 4.5b: Select top alpha signals ---
+print("\n--- 4.5b: Select top alpha signals ---")
+
+selected_alphas_per_hz = {}
+all_selected_alphas = set()
+
+for target_name in HORIZONS.keys():
+    hm = alpha_signal_metrics[target_name]
+    cands = [(f, m) for f, m in hm.items()
+             if abs(m['ir']) > 0.10
+             and abs(m.get('mean_rolling_ic', 0)) > 0.03
+             and m['dir_acc'] > 52]
+    cands.sort(key=lambda x: abs(x[1]['ir']), reverse=True)
+    sel = cands[:10]
+    selected_alphas_per_hz[target_name] = sel
+    for f, _ in sel:
+        all_selected_alphas.add(f)
+    print(f"  {target_name}: {len(cands)} pass filters, top {len(sel)} selected")
+    for f, m in sel:
+        print(f"    {f:<35} IR={m['ir']:+.4f}  IC={m['ic']:+.4f}  "
+              f"DA={m['dir_acc']:.1f}%")
+
+if len(all_selected_alphas) == 0:
+    print("  Relaxing: |IR|>0.05, |IC|>0.02, DirAcc>50%")
+    for target_name in HORIZONS.keys():
+        hm = alpha_signal_metrics[target_name]
+        cands = [(f, m) for f, m in hm.items()
+                 if abs(m['ir']) > 0.05
+                 and abs(m.get('mean_rolling_ic', 0)) > 0.02
+                 and m['dir_acc'] > 50]
+        cands.sort(key=lambda x: abs(x[1]['ir']), reverse=True)
+        sel = cands[:10]
+        selected_alphas_per_hz[target_name] = sel
+        for f, _ in sel:
+            all_selected_alphas.add(f)
+        print(f"  {target_name}: {len(sel)} selected (relaxed)")
+
+if len(all_selected_alphas) == 0:
+    print("  Further relaxing: top 5 by |IR| per horizon (no threshold)")
+    for target_name in HORIZONS.keys():
+        hm = alpha_signal_metrics[target_name]
+        ranked_all = sorted(hm.items(),
+                            key=lambda x: abs(x[1]['ir']), reverse=True)
+        sel = ranked_all[:5]
+        selected_alphas_per_hz[target_name] = sel
+        for f, _ in sel:
+            all_selected_alphas.add(f)
+        print(f"  {target_name}: top 5 selected (no threshold)")
+
+all_selected_alphas = sorted(all_selected_alphas)
+print(f"\n  Unique alpha signals: {len(all_selected_alphas)}")
+
+# --- 4.5c: Build alpha-based positions ---
+print("\n--- 4.5c: Build alpha-based positions ---")
+
+vix_mult_alpha = pd.Series(
+    np.where(vix_smooth > 35, 0.30,
+    np.where(vix_smooth > 25, 0.60, 1.00)), index=close.index)
+
+alpha_positions = {}
+for feat in all_selected_alphas:
+    raw_alpha = pq[feat].copy()
+    roll_m = raw_alpha.rolling(ZSCORE_WINDOW, min_periods=60).mean()
+    roll_s = raw_alpha.rolling(ZSCORE_WINDOW, min_periods=60).std().replace(0, np.nan)
+    z_alpha = ((raw_alpha - roll_m) / roll_s).clip(-5, 5).fillna(0)
+
+    # Signal direction from highest-|IR| horizon
+    best_ir = 0; best_sign = 1.0
+    for tn in HORIZONS:
+        if feat in alpha_signal_metrics[tn]:
+            ir_v = alpha_signal_metrics[tn][feat]['ir']
+            if abs(ir_v) > abs(best_ir):
+                best_ir = ir_v
+                s = np.sign(alpha_signal_metrics[tn][feat]['ic'])
+                best_sign = float(s) if s != 0 else 1.0
+
+    raw_pos_a = np.tanh(z_alpha * best_sign)
+    pos_a = (raw_pos_a * (TARGET_VOL / ewm_vol)).clip(-3, 3)
+    dm_a = pd.Series(np.where((raw_pos_a > 0) & (dxy_mom > 0.04), 0.65, 1.00),
+                     index=close.index)
+    pos_a = pos_a * vix_mult_alpha * dm_a
+    pos_a = pos_a.shift(1).fillna(0)
+    alpha_positions[feat] = pos_a
+    print(f"  Alpha_{feat[:30]:<30s}: mean={pos_a.mean():+.4f}  "
+          f"std={pos_a.std():.3f}  sign={best_sign:+.0f}")
+
+# Top 5 by max |IR| for composite
+alpha_ir_scores = {}
+for feat in all_selected_alphas:
+    max_ir = max((abs(alpha_signal_metrics[tn][feat]['ir'])
+                  for tn in HORIZONS if feat in alpha_signal_metrics[tn]),
+                 default=0)
+    alpha_ir_scores[feat] = max_ir
+top5_alphas = sorted(alpha_ir_scores, key=alpha_ir_scores.get, reverse=True)[:5]
+print(f"\n  Top 5 for composite: {top5_alphas}")
+
+if len(top5_alphas) > 0:
+    alpha_composite_pos = sum(alpha_positions[f] for f in top5_alphas) / len(top5_alphas)
+else:
+    alpha_composite_pos = pd.Series(0.0, index=close.index)
+print(f"  Alpha Composite: mean={alpha_composite_pos.mean():+.4f}  "
+      f"std={alpha_composite_pos.std():.3f}")
+
+# --- 4.5d: Test-set preview ---
+print("\n--- 4.5d: Alpha strategy test-set preview ---")
+print(f"  {'Signal':<35} {'Sharpe':>8} {'AnnRet':>10} {'MaxDD':>10} {'Hit':>8}")
+print(f"  {'-'*75}")
+alpha_preview_list = list(alpha_positions.keys())[:10] + ['_composite_']
+for feat in alpha_preview_list:
+    if feat == '_composite_':
+        p_ev = alpha_composite_pos; lbl = "Alpha_Composite"
+    else:
+        p_ev = alpha_positions[feat]; lbl = f"Alpha_{feat[:25]}"
+    r_ev = (p_ev * ret).dropna()
+    r_te = r_ev[r_ev.index >= SPLIT_TEST]
+    if len(r_te) > 21 and r_te.std() > 0:
+        sh = (r_te.mean() * 252) / (r_te.std() * np.sqrt(252))
+        ar = r_te.mean() * 252
+        cum_e = (1 + r_te).cumprod()
+        dd_e = ((cum_e - cum_e.cummax()) / cum_e.cummax()).min()
+        hit_e = (r_te > 0).mean() * 100
+    else:
+        sh = 0; ar = 0; dd_e = 0; hit_e = 50
+    print(f"  {lbl:<35} {sh:>+8.2f} {ar*100:>+9.1f}% "
+          f"{dd_e*100:>+9.1f}% {hit_e:>7.1f}%")
+
+# ======================================================================
 # 5. LINEAR REGRESSION BASELINE (per horizon)
 # ======================================================================
 print("\n" + "=" * 70)
@@ -1160,6 +1378,15 @@ strategies["S3+LSTM_best"] = 0.5 * pos_s3 + 0.5 * lstm_positions[best_horizon]
 strategies["Master+LSTM_7sig"] = (sum(all_donchian.values()) + lstm_positions[best_horizon]) / 7
 strategies["Master+LSTM_comb"] = (sum(all_donchian.values()) + lstm_positions["combined_3h"]) / 7
 
+# Alpha strategies
+for feat in top5_alphas[:3]:
+    strategies[f"Alpha_{feat[:20]}"] = alpha_positions[feat]
+if len(top5_alphas) > 0:
+    strategies["Alpha_Composite"] = alpha_composite_pos
+    strategies["Alpha+LSTM"] = 0.5 * alpha_composite_pos + 0.5 * lstm_positions[best_horizon]
+    strategies["Master+Alpha+LSTM"] = (
+        sum(all_donchian.values()) + alpha_composite_pos + lstm_positions[best_horizon]) / 8
+
 print(f"\nStrategies: {list(strategies.keys())}")
 
 # ======================================================================
@@ -1214,7 +1441,9 @@ print(f"  {'BuyHold':<23} {bh_tr['sharpe']:>+10.2f} {bh_te['sharpe']:>+10.2f} "
       f"{bh_te['ann_ret']*100:>+9.1f}% {bh_te['max_dd']*100:>+9.1f}% {bh_te['hit']:>9.1f}%")
 
 # --- Annual Sharpe ---
-key_strats_annual = ["S3_DualTF", "LSTM_log_ret20", "LSTM_Combined_3h", "S3+LSTM_best", "Master+LSTM_7sig"]
+key_strats_annual = ["S3_DualTF", "LSTM_log_ret20", "LSTM_Combined_3h", "S3+LSTM_best",
+                     "Master+LSTM_7sig", "Alpha_Composite", "Master+Alpha+LSTM"]
+key_strats_annual = [k for k in key_strats_annual if k in strategies]
 print("\n--- Annual Sharpe (Test) ---")
 print(f"  {'Year':>4}", end="")
 for name in key_strats_annual:
@@ -1238,7 +1467,9 @@ for yr in range(2021, 2026):
 print("\n--- Signal Correlation (Test, daily returns) ---")
 sig_returns = {}
 sig_list_corr = ["S0_Donchian", "S3_DualTF", "Master_6sig",
-                 "LSTM_log_ret20", "LSTM_log_ret30", "LSTM_log_ret60", "LSTM_Combined_3h"]
+                 "LSTM_log_ret20", "LSTM_log_ret30", "LSTM_log_ret60", "LSTM_Combined_3h",
+                 "Alpha_Composite", "Alpha+LSTM", "Master+Alpha+LSTM"]
+sig_list_corr = [s for s in sig_list_corr if s in strategies]
 for name in sig_list_corr:
     if name in strategies:
         r = (strategies[name] * ret).dropna()
@@ -1251,21 +1482,25 @@ print(corr_df.round(3).to_string())
 # ======================================================================
 print("\nGenerating plots...")
 
-fig = plt.figure(figsize=(24, 32))
+fig = plt.figure(figsize=(24, 37))
 fig.suptitle(
-    "Copper Multi-Horizon Prediction: LR Baseline + LSTM\n"
+    "Copper Multi-Horizon Prediction: LR Baseline + LSTM + Alpha Signals\n"
     f"Horizons: {list(HORIZONS.keys())}  |  LSTM: {N_LAYERS}x{HIDDEN}, seq={SEQ_LEN}  |  "
     f"Train 2005-2018 | Val 2019-2020 | Test 2021-2025",
     fontsize=13, fontweight="bold", y=0.995)
 
-gs = gridspec.GridSpec(6, 3, figure=fig, hspace=0.45, wspace=0.30)
+gs = gridspec.GridSpec(7, 3, figure=fig, hspace=0.45, wspace=0.30)
 
 colors_strat = {
     "S0_Donchian": "steelblue", "S3_DualTF": "crimson", "Master_6sig": "grey",
     "LSTM_log_ret20": "darkorange", "LSTM_log_ret30": "forestgreen", "LSTM_log_ret60": "purple",
     "LSTM_Combined_3h": "gold", "S3+LSTM_best": "deeppink", "Master+LSTM_7sig": "black",
     "Master+LSTM_comb": "teal",
+    "Alpha_Composite": "limegreen", "Alpha+LSTM": "magenta", "Master+Alpha+LSTM": "darkblue",
 }
+# Add colors for individual alpha signals
+for _i, _f in enumerate(top5_alphas[:3]):
+    colors_strat[f"Alpha_{_f[:20]}"] = ["#2ca02c", "#d62728", "#9467bd"][_i % 3]
 
 # Row 0: Training curves (one per horizon)
 for j, target_name in enumerate(HORIZONS.keys()):
@@ -1296,7 +1531,9 @@ for j, target_name in enumerate(HORIZONS.keys()):
     ax.legend(fontsize=7, markerscale=3)
 
 # Row 2: Cumulative returns (train+val, test, per-horizon)
-plot_strats = ["S3_DualTF", "Master_6sig", "LSTM_log_ret20", "LSTM_Combined_3h", "S3+LSTM_best", "Master+LSTM_7sig"]
+plot_strats = ["S3_DualTF", "Master_6sig", "LSTM_log_ret20", "LSTM_Combined_3h",
+               "S3+LSTM_best", "Master+LSTM_7sig", "Alpha_Composite", "Master+Alpha+LSTM"]
+plot_strats = [s for s in plot_strats if s in strategies]
 for col, (period, prd_name) in enumerate([(train_period, "Train+Val"), (test_period, "Test")]):
     ax = fig.add_subplot(gs[2, col])
     prd_key = "train" if col == 0 else "test"
@@ -1324,7 +1561,8 @@ ax.legend(fontsize=7); ax.set_xlabel("")
 
 # Row 3: Drawdowns + predictions vs actual + signal correlations
 ax = fig.add_subplot(gs[3, 0])
-for name in ["Master_6sig", "S3+LSTM_best", "Master+LSTM_7sig", "LSTM_Combined_3h"]:
+for name in ["Master_6sig", "S3+LSTM_best", "Master+LSTM_7sig", "LSTM_Combined_3h",
+             "Alpha_Composite", "Master+Alpha+LSTM"]:
     if name not in results_all:
         continue
     m = results_all[name]["test"]
@@ -1359,9 +1597,11 @@ ax.set_title("Signal Return Correlations (Test)", fontweight="bold", fontsize=9)
 
 # Row 4: Annual Sharpe bars + feature importance
 ax = fig.add_subplot(gs[4, 0])
-bar_strats = ["S3_DualTF", "LSTM_log_ret20", "LSTM_Combined_3h", "S3+LSTM_best", "Master+LSTM_7sig"]
+bar_strats = ["S3_DualTF", "LSTM_log_ret20", "LSTM_Combined_3h", "S3+LSTM_best",
+              "Master+LSTM_7sig", "Alpha_Composite", "Master+Alpha+LSTM"]
+bar_strats = [s for s in bar_strats if s in strategies]
 years = list(range(2021, 2026))
-bar_w = 0.15
+bar_w = 0.8 / max(len(bar_strats), 1)
 for j, name in enumerate(bar_strats):
     sharpes_yr = []
     for yr in years:
@@ -1374,13 +1614,13 @@ for j, name in enumerate(bar_strats):
             sharpes_yr.append(0)
     x_pos = np.arange(len(years)) + j * bar_w
     ax.bar(x_pos, sharpes_yr, width=bar_w, label=name[:18], color=colors_strat.get(name, "grey"))
-ax.set_xticks(np.arange(len(years)) + 2 * bar_w)
+ax.set_xticks(np.arange(len(years)) + len(bar_strats) * bar_w / 2)
 ax.set_xticklabels(years)
 ax.axhline(0, color="black", lw=0.8); ax.axhline(2, color="gold", ls="--", lw=1)
 ax.set_title("Annual Sharpe (Test)", fontweight="bold"); ax.legend(fontsize=5); ax.set_xlabel("")
 
 for j, target_name in enumerate(HORIZONS.keys()):
-    ax = fig.add_subplot(gs[4, j + 1]) if j < 2 else fig.add_subplot(gs[5, 0])
+    ax = fig.add_subplot(gs[4, j + 1]) if j < 2 else fig.add_subplot(gs[6, 0])
     top_corrs = selected_features[target_name].head(15)
     if len(top_corrs) > 0:
         colors_bar = ["darkgreen" if v > 0 else "crimson" for v in top_corrs.values]
@@ -1392,8 +1632,78 @@ for j, target_name in enumerate(HORIZONS.keys()):
     ax.set_title(f"Top Features -> {target_name}", fontweight="bold", fontsize=9)
     ax.set_xlabel("Pearson Corr (Train)")
 
-# Row 5: Model + strategy summaries
+# Row 5: Alpha Signal Analysis
+# Panel 5,0: Alpha IC/IR bar chart
+ax = fig.add_subplot(gs[5, 0])
+# Gather top alphas by |IR| across all horizons
+alpha_ir_display = {}
+for tn in HORIZONS:
+    for feat, m in alpha_signal_metrics[tn].items():
+        key = feat
+        if key not in alpha_ir_display or abs(m['ir']) > abs(alpha_ir_display[key]['ir']):
+            alpha_ir_display[key] = {'ic': m['ic'], 'ir': m['ir'], 'horizon': tn}
+alpha_ir_sorted = sorted(alpha_ir_display.items(), key=lambda x: abs(x[1]['ir']), reverse=True)[:20]
+if len(alpha_ir_sorted) > 0:
+    a_names = [f[:25] for f, _ in alpha_ir_sorted]
+    a_ics = [m['ic'] for _, m in alpha_ir_sorted]
+    a_irs = [m['ir'] for _, m in alpha_ir_sorted]
+    y_pos = np.arange(len(a_names))
+    ax.barh(y_pos - 0.15, a_ics, height=0.3, color="steelblue", label="IC")
+    ax.barh(y_pos + 0.15, a_irs, height=0.3, color="darkorange", label="IR")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(a_names, fontsize=5)
+    ax.invert_yaxis()
+    ax.axvline(0, color="black", lw=0.5)
+    ax.legend(fontsize=7)
+ax.set_title("Top 20 Alpha Signals: IC & IR", fontweight="bold", fontsize=9)
+
+# Panel 5,1: Alpha strategy cumulative returns (test)
 ax = fig.add_subplot(gs[5, 1])
+alpha_strat_names = ["Alpha_Composite", "Alpha+LSTM", "Master+Alpha+LSTM"]
+alpha_strat_names = [s for s in alpha_strat_names if s in results_all]
+# Also add top individual alpha signals
+for feat in top5_alphas[:3]:
+    sname = f"Alpha_{feat[:20]}"
+    if sname in results_all:
+        alpha_strat_names.append(sname)
+for name in alpha_strat_names:
+    m = results_all[name]["test"]
+    if len(m.get("cum", [])) > 0:
+        (m["cum"] - 1).plot(ax=ax, color=colors_strat.get(name, "grey"),
+                            lw=2 if "Composite" in name else 1.2,
+                            label=f"{name[:20]} ({m['sharpe']:.2f})")
+# Add S3_DualTF and BuyHold as baselines
+for bname in ["S3_DualTF"]:
+    if bname in results_all:
+        m = results_all[bname]["test"]
+        if len(m.get("cum", [])) > 0:
+            (m["cum"] - 1).plot(ax=ax, color=colors_strat.get(bname, "grey"),
+                                lw=1, ls="--", label=f"{bname} ({m['sharpe']:.2f})")
+ax.set_title("Alpha Strategies (Test)", fontweight="bold")
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x*100:.0f}%"))
+ax.legend(fontsize=5, loc="upper left"); ax.set_xlabel("")
+
+# Panel 5,2: Alpha summary text
+ax = fig.add_subplot(gs[5, 2])
+ax.axis("off")
+alpha_text = f"Alpha Signal Summary\n{'='*30}"
+alpha_text += f"\nSelected: {len(all_selected_alphas)} signals"
+alpha_text += f"\nComposite: top {len(top5_alphas)} by |IR|"
+for f in top5_alphas:
+    best_h = max(HORIZONS, key=lambda tn: abs(alpha_signal_metrics[tn].get(f, {}).get('ir', 0)))
+    m = alpha_signal_metrics[best_h].get(f, {})
+    alpha_text += f"\n  {f[:22]:22s} IR={m.get('ir',0):+.3f}"
+alpha_text += f"\n\nAlpha Strategy Sharpe (Test):"
+for name in ["Alpha_Composite", "Alpha+LSTM", "Master+Alpha+LSTM"]:
+    if name in results_all:
+        m = results_all[name]["test"]
+        alpha_text += f"\n  {name:22s}: {m['sharpe']:+.2f}"
+ax.text(0.05, 0.95, alpha_text, transform=ax.transAxes,
+        fontsize=7, verticalalignment="top", fontfamily="monospace",
+        bbox=dict(boxstyle="round", facecolor="honeydew", alpha=0.8))
+
+# Row 6: Model + strategy summaries
+ax = fig.add_subplot(gs[6, 1])
 ax.axis("off")
 summary_text = "LR vs LSTM Model Summary\n" + "=" * 35
 for target_name in HORIZONS.keys():
@@ -1410,11 +1720,12 @@ ax.text(0.05, 0.95, summary_text, transform=ax.transAxes,
         fontsize=8, verticalalignment="top", fontfamily="monospace",
         bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
 
-ax = fig.add_subplot(gs[5, 2])
+ax = fig.add_subplot(gs[6, 2])
 ax.axis("off")
 strat_text = "Strategy Sharpe (Test)\n" + "=" * 30
 for name in ["S3_DualTF", "LSTM_log_ret20", "LSTM_log_ret30", "LSTM_log_ret60",
-             "LSTM_Combined_3h", "S3+LSTM_best", "Master+LSTM_7sig", "Master+LSTM_comb"]:
+             "LSTM_Combined_3h", "S3+LSTM_best", "Master+LSTM_7sig", "Master+LSTM_comb",
+             "Alpha_Composite", "Alpha+LSTM", "Master+Alpha+LSTM"]:
     if name in results_all:
         m = results_all[name]["test"]
         strat_text += f"\n  {name:22s}: {m['sharpe']:+.2f}"
@@ -1422,8 +1733,9 @@ strat_text += f"\n\n  {'BuyHold':22s}: {bh_te['sharpe']:+.2f}"
 strat_text += f"\n\nBest horizon: {best_horizon}"
 strat_text += f"\nArchitecture: {N_LAYERS}L LSTM, {HIDDEN}h"
 strat_text += f"\nSeq len: {SEQ_LEN}, Dropout: {DROPOUT}"
+strat_text += f"\nAlpha signals: {len(all_selected_alphas)}"
 ax.text(0.05, 0.95, strat_text, transform=ax.transAxes,
-        fontsize=8, verticalalignment="top", fontfamily="monospace",
+        fontsize=7, verticalalignment="top", fontfamily="monospace",
         bbox=dict(boxstyle="round", facecolor="lightcyan", alpha=0.8))
 
 out_path = f"{BASE}/claude/model_results.png"
